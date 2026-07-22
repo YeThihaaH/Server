@@ -131,7 +131,25 @@ def get_heat_zone_detail(zone_id: str):
         .execute()
     )
 
-    return {"zone": zone.data, "history": readings.data}
+    # match ZoneDetailPanel.tsx's exact expected field names: timestamp + temp_c
+    history = [
+        {
+            "temp_c": float(r["temperature"]) if r["temperature"] is not None else None,
+            "source": r["source"],
+            "timestamp": r["recorded_at"],
+        }
+        for r in readings.data
+    ]
+
+    # match ZoneDetailPanel.tsx's expected field name: current_temp_c
+    zone.data["current_temp_c"] = (
+        float(zone.data.pop("current_temp")) if zone.data.get("current_temp") is not None else None
+    )
+    if zone.data.get("green_cover_pct") is not None:
+        zone.data["green_cover_pct"] = float(zone.data["green_cover_pct"])
+
+    # flat shape: zone fields + history alongside, not nested under a "zone" key
+    return {**zone.data, "history": history}
 
 
 # ------------------------------------------------------------
