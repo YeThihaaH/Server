@@ -8,6 +8,7 @@ import json
 from datetime import datetime
 from typing import Optional
 
+import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,7 @@ load_dotenv()  # reads .env automatically — no manual export/set needed
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")  # optional — enables live-traffic routing
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars before starting.")
@@ -176,6 +178,22 @@ def get_heat_zone_detail(zone_id: str):
         }
         for r in readings.data
     ]
+
+    # Real trend from actual historical readings — compares the average of
+    # the 3 most recent readings against the average of the 3 before that.
+    # Not a forecast, just an honest "is it currently trending up/down."
+    trend = "stable"
+    valid_temps = [h["temp_c"] for h in history if h["temp_c"] is not None]
+    if len(valid_temps) >= 4:
+        recent = valid_temps[:3]
+        older = valid_temps[3:6] or valid_temps[3:]
+        if older:
+            diff = (sum(recent) / len(recent)) - (sum(older) / len(older))
+            if diff > 0.3:
+                trend = "rising"
+            elif diff < -0.3:
+                trend = "falling"
+    zone.data["trend"] = trend
 
     # match ZoneDetailPanel.tsx's expected field name: current_temp_c
     zone.data["current_temp_c"] = (
@@ -742,6 +760,327 @@ def get_report(report_id: str):
         raise HTTPException(status_code=404, detail="Report not found")
     row = result.data
     return GeneratedReportDetail(id=row["id"], title=row["title"], generated_at=row["generated_at"], data=row["data"])
+
+
+# ------------------------------------------------------------
+# 10. Heat Safety Assistant — conversational, grounded in real location data
+#
+# HONEST SCOPE NOTE: this finds the user's nearest zone by straight-line
+# distance to zone centroids (same approach as the route safety-check
+# above), not a precise polygon lookup — reasonable for a city-scale zone
+# grid, not perfectly precise at a zone boundary. Every reply is grounded
+# in that zone's real current data plus real nearby cooling centers, not
+# free-floating generation.
+# ------------------------------------------------------------
+class AssistantMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    text: str
+
+
+class AssistantMessageRequest(BaseModel):
+    message: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    history: Optional[list[AssistantMessage]] = None
+    language: Optional[str] = "en"  # "en" or "mm" (Burmese)
+
+
+class AssistantMessageResponse(BaseModel):
+    reply: str
+    zone_context: Optional[dict] = None
+
+
+def _find_nearest_zone(lat: float, lng: float, zones: list[dict]) -> Optional[dict]:
+    best, best_dist = None, float("inf")
+    for z in zones:
+        d = ((z["centroid_lat"] - lat) ** 2 + (z["centroid_lng"] - lng) ** 2) ** 0.5
+        if d < best_dist:
+            best, best_dist = z, d
+    return best
+
+
+@app.post("/assistant/message", response_model=AssistantMessageResponse)
+def assistant_message(req: AssistantMessageRequest):
+    zone_context = None
+    nearby_centers: list[dict] = []
+
+    if req.lat is not None and req.lng is not None:
+        zones = supabase.rpc("get_heat_zones_with_coords").execute().data or []
+        nearest = _find_nearest_zone(req.lat, req.lng, zones) if zones else None
+        if nearest:
+            zone_context = {
+                "name": nearest.get("name"),
+                "risk_level": nearest.get("risk_level"),
+                "current_temp_c": nearest.get("current_temp_c"),
+                "green_cover_pct": nearest.get("green_cover_pct"),
+            }
+        try:
+            centers_result = supabase.rpc(
+                "nearby_cooling_centers",
+                {"lat": req.lat, "lng": req.lng, "radius_km": 5.0},
+            ).execute()
+            nearby_centers = (centers_result.data or [])[:3]
+        except Exception as e:
+            print(f"Assistant: nearby cooling centers lookup failed: {e}")
+
+    if claude_client is None:
+        # Fallback: real data, templated text, no LLM — English only, since
+        # translating this fallback would need either a translation library
+        # or hardcoded Burmese strings, neither of which exists yet. Flag
+        # this honestly rather than serving broken/mixed-language text.
+        if zone_context:
+            reply = (
+                f"You're near {zone_context['name']}, currently {zone_context['risk_level']} risk "
+                f"at {zone_context['current_temp_c']}°C. "
+            )
+            if nearby_centers:
+                reply += f"Nearest cooling option: {nearby_centers[0].get('name', 'a nearby center')}."
+            else:
+                reply += "No nearby cooling centers found in range."
+        else:
+            reply = "Share your location so I can give a recommendation grounded in your nearest zone's real data."
+        return AssistantMessageResponse(reply=reply, zone_context=zone_context)
+
+    context_block = ""
+    if zone_context:
+        context_block += (
+            f"\nUser's nearest monitored zone: {zone_context['name']}, "
+            f"{zone_context['risk_level']} risk, {zone_context['current_temp_c']}°C, "
+            f"{zone_context['green_cover_pct']}% green cover."
+        )
+    if nearby_centers:
+        names = ", ".join(c.get("name", "unnamed") for c in nearby_centers)
+        context_block += f"\nNearby cooling centers/water stations: {names}."
+    if not zone_context and not nearby_centers:
+        context_block = "\nNo location shared yet — don't assume a location, ask for it if relevant."
+
+    history_block = ""
+    if req.history:
+        history_block = "\n".join(f"{m.role}: {m.text}" for m in req.history[-6:])
+
+    language_instruction = (
+        "Respond in Burmese (Myanmar language), using natural everyday Burmese, not literal word-for-word translation."
+        if req.language == "mm"
+        else "Respond in English."
+    )
+
+    prompt = f"""You are a heat-safety assistant for a citizen-facing urban heat app. Be concise (2-4 sentences),
+practical, and only state facts you're given below — never invent a specific zone name, temperature,
+or cooling-center name that isn't in this context. {language_instruction}
+{context_block}
+
+Recent conversation:
+{history_block}
+
+User's new message: {req.message}
+
+Reply directly to the user, in plain conversational text, no preamble."""
+
+    try:
+        response = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=250,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        reply = response.content[0].text.strip()
+    except Exception as e:
+        print(f"Assistant Claude call failed: {e}")
+        reply = "Sorry, I couldn't process that right now. Try again in a moment."
+
+    return AssistantMessageResponse(reply=reply, zone_context=zone_context)
+
+
+# ------------------------------------------------------------
+# 11. Nearby Hospitals — real locations from OpenStreetMap (Overpass API)
+#
+# Free, no API key. Coverage depends on how well an area is mapped in OSM —
+# generally solid for dense urban areas like Yangon, but not a guaranteed-
+# complete hospital registry. Flag this honestly if asked; it's real data,
+# not a fabricated list, but it's crowdsourced map data, not an official
+# health-ministry registry.
+# ------------------------------------------------------------
+@app.get("/hospitals/nearby")
+def get_nearby_hospitals(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    radius_km: float = Query(15.0),
+):
+    radius_m = int(radius_km * 1000)
+    # Broader tag coverage — OSM contributors in some regions tag hospitals
+    # inconsistently (amenity=hospital, healthcare=hospital, or just
+    # amenity=clinic for smaller facilities). Checking all three catches
+    # more real facilities without inventing anything not in OSM.
+    query = f"""
+    [out:json][timeout:20];
+    (
+      node["amenity"="hospital"](around:{radius_m},{lat},{lng});
+      way["amenity"="hospital"](around:{radius_m},{lat},{lng});
+      node["healthcare"="hospital"](around:{radius_m},{lat},{lng});
+      way["healthcare"="hospital"](around:{radius_m},{lat},{lng});
+      node["amenity"="clinic"](around:{radius_m},{lat},{lng});
+      way["amenity"="clinic"](around:{radius_m},{lat},{lng});
+    );
+    out center tags;
+    """
+    try:
+        resp = requests.post(
+            "https://overpass-api.de/api/interpreter",
+            data={"data": query},
+            timeout=12,
+        )
+        resp.raise_for_status()
+        elements = resp.json().get("elements", [])
+    except Exception as e:
+        # Overpass is a free, shared, occasionally slow/rate-limited public
+        # service — don't fail the whole page over it. Log and return an
+        # empty list so the map just shows no hospital pins instead of an
+        # error the user can't do anything about.
+        print(f"Hospital lookup failed (Overpass): {e}")
+        return []
+
+    hospitals = []
+    for el in elements:
+        tags = el.get("tags", {})
+        if el["type"] == "node":
+            hlat, hlng = el.get("lat"), el.get("lon")
+        else:
+            center = el.get("center", {})
+            hlat, hlng = center.get("lat"), center.get("lon")
+        if hlat is None or hlng is None:
+            continue
+        hospitals.append(
+            {
+                "id": f"osm-{el['type']}-{el['id']}",
+                "name": tags.get("name", "Unnamed facility"),
+                "lat": hlat,
+                "lng": hlng,
+                "emergency": tags.get("emergency") == "yes",
+                "phone": tags.get("phone") or tags.get("contact:phone"),
+                "facility_type": tags.get("amenity") or tags.get("healthcare") or "hospital",
+                "source": "OpenStreetMap",
+            }
+        )
+    return hospitals
+
+
+# ------------------------------------------------------------
+# 12. Route Directions — real road-following route via OSRM (free, no key)
+#
+# HONEST SCOPE NOTE: OSRM's public demo server (router.project-osrm.org) has
+# no live traffic awareness — ETAs assume free-flow speeds, not current
+# conditions. It's also a shared public demo server, not something with an
+# uptime guarantee for production. Real routing geometry/ETA, just not
+# traffic-aware. This is a genuine upgrade over the old straight-line
+# heuristic in /route/safety-check, not a replacement for it — combine both
+# if you want a route that's both real-road-following AND heat-risk-aware.
+# ------------------------------------------------------------
+class RouteDirectionsRequest(BaseModel):
+    origin_lat: float
+    origin_lng: float
+    dest_lat: float
+    dest_lng: float
+
+
+def _decode_polyline(encoded: str) -> list[list[float]]:
+    """Decode Google's encoded polyline format into [lng, lat] pairs, matching
+    the GeoJSON coordinate order the frontend already expects from OSRM."""
+    points = []
+    index = lat = lng = 0
+    length = len(encoded)
+    while index < length:
+        for is_lat in (True, False):
+            shift = result = 0
+            while True:
+                b = ord(encoded[index]) - 63
+                index += 1
+                result |= (b & 0x1F) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            delta = ~(result >> 1) if (result & 1) else (result >> 1)
+            if is_lat:
+                lat += delta
+            else:
+                lng += delta
+        points.append([lng / 1e5, lat / 1e5])
+    return points
+
+
+def _get_route_google(req: RouteDirectionsRequest) -> Optional[dict]:
+    """Real, live traffic-aware routing via Google's Routes API. Returns None
+    (never raises) on any failure so the caller can silently fall back to
+    OSRM — same honest-fallback pattern used throughout this file."""
+    if not GOOGLE_MAPS_API_KEY:
+        return None
+    try:
+        resp = requests.post(
+            "https://routes.googleapis.com/directions/v2:computeRoutes",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+                "X-Goog-FieldMask": (
+                    "routes.duration,routes.distanceMeters,"
+                    "routes.polyline.encodedPolyline,routes.staticDuration"
+                ),
+            },
+            json={
+                "origin": {"location": {"latLng": {"latitude": req.origin_lat, "longitude": req.origin_lng}}},
+                "destination": {"location": {"latLng": {"latitude": req.dest_lat, "longitude": req.dest_lng}}},
+                "travelMode": "DRIVE",
+                "routingPreference": "TRAFFIC_AWARE",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        route = data["routes"][0]
+        duration_s = float(route["duration"].rstrip("s"))
+        static_duration_s = float(route.get("staticDuration", route["duration"]).rstrip("s"))
+        coords = _decode_polyline(route["polyline"]["encodedPolyline"])
+        return {
+            "distance_m": route["distanceMeters"],
+            "duration_s": duration_s,
+            "duration_no_traffic_s": static_duration_s,
+            "geometry": {"type": "LineString", "coordinates": coords},
+            "note": "Live traffic-aware route via Google Routes API.",
+            "provider": "google",
+        }
+    except Exception as e:
+        print(f"Google Routes API failed, falling back to OSRM: {e}")
+        return None
+
+
+@app.post("/route/directions")
+def get_route_directions(req: RouteDirectionsRequest):
+    google_result = _get_route_google(req)
+    if google_result:
+        return google_result
+
+    # --- Fallback: OSRM, free, no live traffic ---
+    url = (
+        f"https://router.project-osrm.org/route/v1/driving/"
+        f"{req.origin_lng},{req.origin_lat};{req.dest_lng},{req.dest_lat}"
+        f"?overview=full&geometries=geojson"
+    )
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Routing failed: {e}")
+
+    if data.get("code") != "Ok" or not data.get("routes"):
+        raise HTTPException(status_code=404, detail="No route found")
+
+    route = data["routes"][0]
+    return {
+        "distance_m": route["distance"],
+        "duration_s": route["duration"],
+        "duration_no_traffic_s": None,
+        "geometry": route["geometry"],
+        "note": "Free-flow ETA, no live traffic data — OSRM public demo server.",
+        "provider": "osrm",
+    }
 
 
 # ------------------------------------------------------------
