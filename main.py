@@ -1296,12 +1296,35 @@ def _get_hospitals_google(lat: float, lng: float, radius_m: int) -> Optional[lis
     return hospitals
 
 
+# In-process cache for /hospitals/nearby — see comment inside the endpoint
+# for why this exists. (lat_rounded, lng_rounded, radius_km) -> (cached_at_epoch, result_list)
+_HOSPITAL_CACHE: dict[tuple[float, float, float], tuple[float, list[dict]]] = {}
+HOSPITAL_CACHE_TTL_SECONDS = 30 * 60  # 30 minutes — hospital locations don't move
+
+
 @app.get("/hospitals/nearby")
 def get_nearby_hospitals(
     lat: float = Query(...),
     lng: float = Query(...),
     radius_km: float = Query(15.0),
 ):
+    # Simple in-process cache, keyed by lat/lng rounded to ~1km precision +
+    # radius. Both hospital data sources (Google Places and Overpass) are
+    # external services that can go down independently of your own app —
+    # this means once ANY request for a given area succeeds, every other
+    # visitor near that same spot for the next 30 minutes gets served
+    # instantly from memory instead of also depending on Overpass/Google
+    # being up at that exact moment. This resets on server restart (it's
+    # in-process, not persisted) — fine for a hackathon demo; move to
+    # Supabase/Redis if this needs to survive restarts later.
+    cache_key = (round(lat, 2), round(lng, 2), round(radius_km, 1))
+    cached = _HOSPITAL_CACHE.get(cache_key)
+    if cached is not None:
+        cached_at, cached_result = cached
+        if datetime.utcnow().timestamp() - cached_at < HOSPITAL_CACHE_TTL_SECONDS:
+            print(f"[DEBUG] hospitals cache hit for {cache_key}: {len(cached_result)} hospitals")
+            return cached_result
+
     radius_m = int(radius_km * 1000)
     print(f"[DEBUG] GOOGLE_MAPS_API_KEY set: {bool(GOOGLE_MAPS_API_KEY)}")
 
@@ -1311,7 +1334,9 @@ def get_nearby_hospitals(
         def _dist_google(h: dict) -> float:
             return ((h["lat"] - lat) ** 2 + (h["lng"] - lng) ** 2) ** 0.5
         google_result.sort(key=_dist_google)
-        return google_result[:15]
+        capped = google_result[:15]
+        _HOSPITAL_CACHE[cache_key] = (datetime.utcnow().timestamp(), capped)
+        return capped
 
     # Broader tag coverage — OSM contributors in some regions tag hospitals
     # inconsistently (amenity=hospital, healthcare=hospital, or just
@@ -1351,7 +1376,14 @@ def get_nearby_hospitals(
     last_error = None
     for mirror_url in OVERPASS_MIRRORS:
         try:
-            resp = requests.post(mirror_url, data={"data": query}, timeout=12, headers=headers)
+            # Reduced from 12s to 5s per mirror. These are free, shared,
+            # increasingly unreliable public mirrors — waiting up to 36s
+            # total (3 mirrors x 12s) before giving up is a bad experience
+            # for a real visitor even when it eventually succeeds. Failing
+            # faster means the map/fallback state shows up sooner; a
+            # genuinely slow-but-working mirror gets skipped in favor of a
+            # faster one, which is the right tradeoff here.
+            resp = requests.post(mirror_url, data={"data": query}, timeout=5, headers=headers)
             resp.raise_for_status()
             elements = resp.json().get("elements", [])
             last_error = None
@@ -1400,7 +1432,9 @@ def get_nearby_hospitals(
         return ((h["lat"] - lat) ** 2 + (h["lng"] - lng) ** 2) ** 0.5
 
     hospitals.sort(key=_dist)
-    return hospitals[:15]
+    capped = hospitals[:15]
+    _HOSPITAL_CACHE[cache_key] = (datetime.utcnow().timestamp(), capped)
+    return capped
 
 
 # ------------------------------------------------------------
