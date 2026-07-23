@@ -209,6 +209,38 @@ def get_heat_zone_detail(zone_id: str):
 # ------------------------------------------------------------
 # 2. Cooling Centers (nearest lookup)
 # ------------------------------------------------------------
+def _lookup_cooling_centers(lat: float, lng: float, radius_km: float = 5.0) -> list[dict]:
+    """
+    Shared lookup used by both GET /cooling-centers/nearby and the
+    assistant's get_nearby_cooling_centers tool, so there's exactly one
+    place this logic lives instead of two copies that could drift apart.
+
+    Wrapped in try/except so a broken/missing RPC (PostGIS not enabled,
+    function renamed, table empty causing an unexpected shape) returns an
+    empty list instead of raising — same honest-fallback pattern used for
+    hospitals.
+    """
+    try:
+        result = supabase.rpc(
+            "nearby_cooling_centers",
+            {"lat": lat, "lng": lng, "radius_km": radius_km},
+        ).execute()
+        centers = result.data or []
+    except Exception as e:
+        print(f"Cooling centers lookup failed: {e}")
+        return []
+
+    print(f"[DEBUG] cooling centers query lat={lat} lng={lng} radius_km={radius_km}: {len(centers)} results")
+
+    # Cap to nearest 15, same rationale as hospitals — if the RPC's own
+    # distance sort isn't guaranteed, sort here too before slicing.
+    def _dist(c: dict) -> float:
+        return ((c.get("lat", lat) - lat) ** 2 + (c.get("lng", lng) - lng) ** 2) ** 0.5
+
+    centers.sort(key=_dist)
+    return centers[:15]
+
+
 @app.get("/cooling-centers/nearby")
 def get_nearby_cooling_centers(
     lat: float = Query(...),
@@ -219,11 +251,7 @@ def get_nearby_cooling_centers(
     Nearest cooling centers using PostGIS. Calls an RPC function (see below)
     because Supabase's REST layer can't do ST_DWithin directly.
     """
-    result = supabase.rpc(
-        "nearby_cooling_centers",
-        {"lat": lat, "lng": lng, "radius_km": radius_km},
-    ).execute()
-    return result.data
+    return _lookup_cooling_centers(lat, lng, radius_km)
 
 
 # ------------------------------------------------------------
@@ -763,14 +791,26 @@ def get_report(report_id: str):
 
 
 # ------------------------------------------------------------
-# 10. Heat Safety Assistant — conversational, grounded in real location data
+# 10. Heat Safety Assistant — tool-using agent
 #
-# HONEST SCOPE NOTE: this finds the user's nearest zone by straight-line
-# distance to zone centroids (same approach as the route safety-check
-# above), not a precise polygon lookup — reasonable for a city-scale zone
-# grid, not perfectly precise at a zone boundary. Every reply is grounded
-# in that zone's real current data plus real nearby cooling centers, not
-# free-floating generation.
+# Instead of pre-fetching a fixed bundle (nearest zone + 3 cooling
+# centers) on every message, Claude now decides which real backend
+# endpoints it actually needs for the question asked, calls them as
+# tools, and only then answers — grounded in whatever it actually
+# looked up, nothing invented.
+#
+# HONEST SCOPE NOTE on check_route_safety: this tool requires real
+# destination coordinates. There's no geocoder in this stack to turn a
+# typed place name ("the market on 5th street") into lat/lng, so the
+# system prompt instructs Claude to ask the user to share/select a
+# destination (e.g. tap it on the map) rather than guess coordinates —
+# same honesty rule as everywhere else in this file: no invented facts.
+#
+# HONEST SCOPE NOTE on submit_cooling_gap_report: this is the one tool
+# that takes a real action (writes a row to cooling_gap_reports) rather
+# than just reading data. The system prompt instructs Claude to only
+# call it when the user has clearly and explicitly asked for a report
+# to be filed, not merely described a problem in passing.
 # ------------------------------------------------------------
 class AssistantMessage(BaseModel):
     role: str  # "user" or "assistant"
@@ -783,11 +823,269 @@ class AssistantMessageRequest(BaseModel):
     lng: Optional[float] = None
     history: Optional[list[AssistantMessage]] = None
     language: Optional[str] = "en"  # "en" or "mm" (Burmese)
+    # Optional: if the frontend already has a destination selected (e.g. a
+    # hospital/cooling-center pin tapped on the map), pass its coordinates
+    # here so check_route_safety can use them without needing a geocoder.
+    dest_lat: Optional[float] = None
+    dest_lng: Optional[float] = None
 
 
 class AssistantMessageResponse(BaseModel):
     reply: str
     zone_context: Optional[dict] = None
+    # Populated only when submit_cooling_gap_report was actually called
+    # during this turn, so the frontend can show a concrete confirmation
+    # (e.g. a toast with the report id) rather than just trusting the text.
+    report_submitted: Optional[dict] = None
+
+
+ASSISTANT_TOOLS = [
+    {
+        "name": "get_location_context",
+        "description": (
+            "Get the user's nearest monitored heat zone: name, risk level, "
+            "current temperature, green cover %, and trend. Uses the "
+            "user's current lat/lng already provided in this conversation "
+            "— call this first whenever you need to know the user's "
+            "current heat risk and don't already have it from earlier in "
+            "this same turn."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_nearby_cooling_centers",
+        "description": (
+            "Get real cooling centers / water stations near the user's "
+            "current location, with distance, hours, capacity, and contact "
+            "info. Never invent a cooling center name — always call this "
+            "before recommending one."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "radius_km": {"type": "number", "description": "Search radius in km. Default 5."}
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_nearby_hospitals",
+        "description": (
+            "Get real hospitals/clinics near the user's current location, "
+            "with distance, phone, and whether they're marked 24/7 "
+            "emergency. Use this for heat-stroke or medical-emergency "
+            "questions. Never invent a hospital name — always call this "
+            "before recommending one."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "radius_km": {"type": "number", "description": "Search radius in km. Default 15."}
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "check_route_safety",
+        "description": (
+            "Check whether a route from the user's current location to a "
+            "destination passes through elevated heat-risk zones. "
+            "Requires REAL destination coordinates — never guess or "
+            "estimate coordinates for a place name you don't have exact "
+            "coordinates for. If you don't have destination coordinates "
+            "available, ask the user to share or select the destination "
+            "(e.g. tap it on the map) instead of calling this tool."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dest_lat": {"type": "number"},
+                "dest_lng": {"type": "number"},
+            },
+            "required": ["dest_lat", "dest_lng"],
+        },
+    },
+    {
+        "name": "get_zone_trend",
+        "description": (
+            "Get the recent temperature trend (rising/falling/stable) and "
+            "last few readings for a heat zone. If zone_id is omitted, "
+            "uses the user's nearest zone (call get_location_context first "
+            "if you don't already know it)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "zone_id": {"type": "string", "description": "Zone id. Omit to use the user's nearest zone."}
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "submit_cooling_gap_report",
+        "description": (
+            "File a cooling-gap report at the user's current location on "
+            "their behalf. ONLY call this when the user has clearly and "
+            "explicitly asked you to submit/file/report something (e.g. "
+            "'report that there's no cooling center here', 'file a "
+            "report, it's closed'). Do NOT call this just because the "
+            "user is describing a problem conversationally — if it's "
+            "ambiguous whether they want it submitted, ask them to "
+            "confirm first instead of calling this tool."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": [
+                        "no_cooling_center",
+                        "insufficient_capacity",
+                        "closed_or_inactive",
+                        "too_far",
+                        "other",
+                    ],
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional extra detail drawn from the user's message.",
+                },
+            },
+            "required": ["category"],
+        },
+    },
+]
+
+
+def _zone_trend_summary(zone_id: str) -> dict:
+    """
+    Lightweight standalone version of the trend calculation already used
+    in GET /heat-zones/{zone_id} — kept separate rather than importing
+    that endpoint's full response (which also does centroid lookups etc.
+    the assistant doesn't need) to keep this tool call cheap and focused.
+    """
+    zone = (
+        supabase.table("heat_zones")
+        .select("id, zone_name, current_temp, risk_level")
+        .eq("id", zone_id)
+        .single()
+        .execute()
+    )
+    if not zone.data:
+        return {"error": "zone not found"}
+
+    readings = (
+        supabase.table("heat_readings")
+        .select("temperature, recorded_at")
+        .eq("zone_id", zone_id)
+        .order("recorded_at", desc=True)
+        .limit(6)
+        .execute()
+    )
+    temps = [float(r["temperature"]) for r in readings.data if r["temperature"] is not None]
+
+    trend = "stable"
+    if len(temps) >= 4:
+        recent = temps[:3]
+        older = temps[3:6] or temps[3:]
+        if older:
+            diff = (sum(recent) / len(recent)) - (sum(older) / len(older))
+            if diff > 0.3:
+                trend = "rising"
+            elif diff < -0.3:
+                trend = "falling"
+
+    return {
+        "zone_name": zone.data["zone_name"],
+        "current_temp_c": zone.data.get("current_temp"),
+        "risk_level": zone.data.get("risk_level"),
+        "trend": trend,
+        "recent_readings_c": temps,
+    }
+
+
+def _dispatch_assistant_tool(name: str, tool_input: dict, req: AssistantMessageRequest, state: dict) -> dict:
+    """
+    Executes one tool call and returns a JSON-serializable result to feed
+    back to Claude. `state` is a small mutable dict the assistant_message
+    endpoint uses to collect side effects across the tool-use loop (the
+    zone_context to surface in the HTTP response, and confirmation of any
+    report that actually got submitted).
+    """
+    if name == "get_location_context":
+        if req.lat is None or req.lng is None:
+            return {"error": "no location shared by the user yet"}
+        zones = supabase.rpc("get_heat_zones_with_coords").execute().data or []
+        nearest = _find_nearest_zone(req.lat, req.lng, zones) if zones else None
+        if not nearest:
+            return {"error": "no monitored zones available"}
+        context = {
+            "zone_id": nearest.get("id"),
+            "name": nearest.get("name"),
+            "risk_level": nearest.get("risk_level"),
+            "current_temp_c": nearest.get("current_temp_c"),
+            "green_cover_pct": nearest.get("green_cover_pct"),
+        }
+        state["zone_context"] = context
+        state["last_zone_id"] = nearest.get("id")
+        return context
+
+    if name == "get_nearby_cooling_centers":
+        if req.lat is None or req.lng is None:
+            return {"error": "no location shared by the user yet"}
+        radius_km = tool_input.get("radius_km", 5.0)
+        centers = _lookup_cooling_centers(req.lat, req.lng, radius_km)
+        return {"centers": centers, "count": len(centers)}
+
+    if name == "get_nearby_hospitals":
+        if req.lat is None or req.lng is None:
+            return {"error": "no location shared by the user yet"}
+        radius_km = tool_input.get("radius_km", 15.0)
+        hospitals = get_nearby_hospitals(lat=req.lat, lng=req.lng, radius_km=radius_km)
+        return {"hospitals": hospitals, "count": len(hospitals)}
+
+    if name == "check_route_safety":
+        if req.lat is None or req.lng is None:
+            return {"error": "no user location shared yet"}
+        try:
+            result = check_route_safety(
+                RouteSafetyRequest(
+                    origin_lat=req.lat,
+                    origin_lng=req.lng,
+                    dest_lat=tool_input["dest_lat"],
+                    dest_lng=tool_input["dest_lng"],
+                )
+            )
+            return result
+        except HTTPException as e:
+            return {"error": e.detail}
+
+    if name == "get_zone_trend":
+        zone_id = tool_input.get("zone_id") or state.get("last_zone_id")
+        if not zone_id:
+            return {"error": "no zone_id available — call get_location_context first, or ask the user for a zone"}
+        return _zone_trend_summary(zone_id)
+
+    if name == "submit_cooling_gap_report":
+        if req.lat is None or req.lng is None:
+            return {"error": "no user location shared yet — can't file a report without a location"}
+        try:
+            result = submit_cooling_gap_report(
+                CoolingGapReportRequest(
+                    lat=req.lat,
+                    lng=req.lng,
+                    category=tool_input["category"],
+                    description=tool_input.get("description"),
+                    reporter_contact=None,
+                    zone_id=state.get("last_zone_id"),
+                )
+            )
+            state["report_submitted"] = {"category": tool_input["category"], "result": result}
+            return {"success": True, "result": result}
+        except HTTPException as e:
+            return {"error": e.detail}
+
+    return {"error": f"unknown tool: {name}"}
 
 
 def _find_nearest_zone(lat: float, lng: float, zones: list[dict]) -> Optional[dict]:
@@ -801,93 +1099,126 @@ def _find_nearest_zone(lat: float, lng: float, zones: list[dict]) -> Optional[di
 
 @app.post("/assistant/message", response_model=AssistantMessageResponse)
 def assistant_message(req: AssistantMessageRequest):
-    zone_context = None
-    nearby_centers: list[dict] = []
-
-    if req.lat is not None and req.lng is not None:
-        zones = supabase.rpc("get_heat_zones_with_coords").execute().data or []
-        nearest = _find_nearest_zone(req.lat, req.lng, zones) if zones else None
-        if nearest:
-            zone_context = {
-                "name": nearest.get("name"),
-                "risk_level": nearest.get("risk_level"),
-                "current_temp_c": nearest.get("current_temp_c"),
-                "green_cover_pct": nearest.get("green_cover_pct"),
-            }
-        try:
-            centers_result = supabase.rpc(
-                "nearby_cooling_centers",
-                {"lat": req.lat, "lng": req.lng, "radius_km": 5.0},
-            ).execute()
-            nearby_centers = (centers_result.data or [])[:3]
-        except Exception as e:
-            print(f"Assistant: nearby cooling centers lookup failed: {e}")
+    state: dict = {}
 
     if claude_client is None:
-        # Fallback: real data, templated text, no LLM — English only, since
-        # translating this fallback would need either a translation library
-        # or hardcoded Burmese strings, neither of which exists yet. Flag
-        # this honestly rather than serving broken/mixed-language text.
+        # Fallback with no LLM at all: same minimal templated behavior as
+        # before, real data only, no tool-calling possible without a model.
+        zone_context = None
+        if req.lat is not None and req.lng is not None:
+            zones = supabase.rpc("get_heat_zones_with_coords").execute().data or []
+            nearest = _find_nearest_zone(req.lat, req.lng, zones) if zones else None
+            if nearest:
+                zone_context = {
+                    "name": nearest.get("name"),
+                    "risk_level": nearest.get("risk_level"),
+                    "current_temp_c": nearest.get("current_temp_c"),
+                    "green_cover_pct": nearest.get("green_cover_pct"),
+                }
         if zone_context:
             reply = (
                 f"You're near {zone_context['name']}, currently {zone_context['risk_level']} risk "
-                f"at {zone_context['current_temp_c']}°C. "
+                f"at {zone_context['current_temp_c']}°C."
             )
-            if nearby_centers:
-                reply += f"Nearest cooling option: {nearby_centers[0].get('name', 'a nearby center')}."
-            else:
-                reply += "No nearby cooling centers found in range."
         else:
             reply = "Share your location so I can give a recommendation grounded in your nearest zone's real data."
         return AssistantMessageResponse(reply=reply, zone_context=zone_context)
 
-    context_block = ""
-    if zone_context:
-        context_block += (
-            f"\nUser's nearest monitored zone: {zone_context['name']}, "
-            f"{zone_context['risk_level']} risk, {zone_context['current_temp_c']}°C, "
-            f"{zone_context['green_cover_pct']}% green cover."
-        )
-    if nearby_centers:
-        names = ", ".join(c.get("name", "unnamed") for c in nearby_centers)
-        context_block += f"\nNearby cooling centers/water stations: {names}."
-    if not zone_context and not nearby_centers:
-        context_block = "\nNo location shared yet — don't assume a location, ask for it if relevant."
-
-    history_block = ""
-    if req.history:
-        history_block = "\n".join(f"{m.role}: {m.text}" for m in req.history[-6:])
-
     language_instruction = (
-        "Respond in Burmese (Myanmar language), using natural everyday Burmese, not literal word-for-word translation."
+        "Respond in Burmese (Myanmar language). Use short, simple, grammatically correct "
+        "everyday spoken Burmese — the way a person would actually text a friend, not "
+        "literary or formal written Burmese, not a word-for-word translation of English "
+        "sentence structure. Prefer short independent sentences over long compound ones. "
+        "If a Burmese sentence is getting long or complex, split it into two simpler "
+        "sentences instead. Double-check subject-verb agreement and particle usage before "
+        "finalizing your reply — grammatically broken Burmese is worse than a shorter, "
+        "simpler correct sentence."
         if req.language == "mm"
         else "Respond in English."
     )
 
-    prompt = f"""You are a heat-safety assistant for a citizen-facing urban heat app. Be concise (2-4 sentences),
-practical, and only state facts you're given below — never invent a specific zone name, temperature,
-or cooling-center name that isn't in this context. {language_instruction}
-{context_block}
+    location_note = (
+        f"\nUser's current location: lat={req.lat}, lng={req.lng}."
+        if req.lat is not None and req.lng is not None
+        else "\nNo location shared yet — don't assume one; ask for it if a tool needs it."
+    )
+    dest_note = (
+        f"\nA destination is already selected: lat={req.dest_lat}, lng={req.dest_lng} — "
+        "use these directly with check_route_safety if the user asks about route safety, "
+        "don't ask them to re-share it."
+        if req.dest_lat is not None and req.dest_lng is not None
+        else ""
+    )
 
-Recent conversation:
-{history_block}
+    system_prompt = f"""You are a heat-safety assistant for a citizen-facing urban heat app. Be concise
+(2-4 sentences per reply), practical, and only state facts backed by a tool call — never invent a
+specific zone name, temperature, cooling-center name, or hospital name. {language_instruction}
+{location_note}{dest_note}
 
-User's new message: {req.message}
+Use the available tools whenever you need real data to answer accurately. Call get_location_context
+before stating the user's current risk/temperature if you don't already have it in this conversation.
+Only call submit_cooling_gap_report when the user has clearly asked you to file a report."""
 
-Reply directly to the user, in plain conversational text, no preamble."""
+    # Build message history for the Anthropic Messages API
+    messages: list[dict] = []
+    if req.history:
+        for m in req.history[-6:]:
+            messages.append({"role": m.role, "content": m.text})
+    messages.append({"role": "user", "content": req.message})
+
+    # Haiku's non-English fluency is noticeably weaker than Sonnet's —
+    # confirmed here by grammatically broken Burmese output. Burmese
+    # replies specifically get the stronger model; English stays on Haiku
+    # since that's where the cost/speed tradeoff is worth it.
+    assistant_model = "claude-sonnet-5" if req.language == "mm" else "claude-haiku-4-5-20251001"
+
+    reply_text = "Sorry, I couldn't process that right now. Try again in a moment."
+    MAX_TOOL_ROUNDS = 5
 
     try:
-        response = claude_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=250,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        reply = response.content[0].text.strip()
+        for _ in range(MAX_TOOL_ROUNDS):
+            response = claude_client.messages.create(
+                model=assistant_model,
+                max_tokens=500,
+                system=system_prompt,
+                tools=ASSISTANT_TOOLS,
+                messages=messages,
+            )
+
+            if response.stop_reason != "tool_use":
+                # Model produced a final text answer — done.
+                reply_text = "".join(
+                    block.text for block in response.content if block.type == "text"
+                ).strip() or reply_text
+                break
+
+            # Model wants to call one or more tools — execute each, append
+            # the assistant's tool_use turn and our tool_result turn, then
+            # loop so it can either call more tools or give a final answer.
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                result = _dispatch_assistant_tool(block.name, block.input, req, state)
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(result),
+                    }
+                )
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            print("Assistant: hit MAX_TOOL_ROUNDS without a final answer")
     except Exception as e:
         print(f"Assistant Claude call failed: {e}")
-        reply = "Sorry, I couldn't process that right now. Try again in a moment."
 
-    return AssistantMessageResponse(reply=reply, zone_context=zone_context)
+    return AssistantMessageResponse(
+        reply=reply_text,
+        zone_context=state.get("zone_context"),
+        report_submitted=state.get("report_submitted"),
+    )
 
 
 # ------------------------------------------------------------
@@ -899,6 +1230,72 @@ Reply directly to the user, in plain conversational text, no preamble."""
 # not a fabricated list, but it's crowdsourced map data, not an official
 # health-ministry registry.
 # ------------------------------------------------------------
+def _get_hospitals_google(lat: float, lng: float, radius_m: int) -> Optional[list[dict]]:
+    """
+    Real hospital/clinic locations via Google Places API (New) Nearby Search.
+    Returns None (never raises) on any failure — including no API key set —
+    so the caller can silently fall back to OSM/Overpass, same honest-
+    fallback pattern used for routing (_get_route_google).
+
+    Google Places generally has denser, more consistently maintained
+    coverage than OSM outside central Yangon, but is a paid API past its
+    free tier — that's the tradeoff for using it as primary here.
+    """
+    if not GOOGLE_MAPS_API_KEY:
+        return None
+    try:
+        resp = requests.post(
+            "https://places.googleapis.com/v1/places:searchNearby",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+                "X-Goog-FieldMask": (
+                    "places.id,places.displayName,places.location,"
+                    "places.internationalPhoneNumber,places.types"
+                ),
+            },
+            json={
+                "includedTypes": ["hospital"],
+                "maxResultCount": 15,
+                "locationRestriction": {
+                    "circle": {
+                        "center": {"latitude": lat, "longitude": lng},
+                        "radius": float(radius_m),
+                    }
+                },
+            },
+            timeout=12,
+        )
+        resp.raise_for_status()
+        places = resp.json().get("places", [])
+    except Exception as e:
+        print(f"Google Places hospital lookup failed, falling back to OSM: {e}")
+        return None
+
+    hospitals = []
+    for p in places:
+        loc = p.get("location", {})
+        hlat, hlng = loc.get("latitude"), loc.get("longitude")
+        if hlat is None or hlng is None:
+            continue
+        hospitals.append(
+            {
+                "id": f"google-{p.get('id')}",
+                "name": (p.get("displayName") or {}).get("text", "Unnamed facility"),
+                "lat": hlat,
+                "lng": hlng,
+                # Google Places doesn't expose a direct "24/7 emergency" flag
+                # the way OSM's emergency=yes tag does — leaving this False
+                # rather than guessing is the honest choice here.
+                "emergency": False,
+                "phone": p.get("internationalPhoneNumber"),
+                "facility_type": "hospital",
+                "source": "Google Places",
+            }
+        )
+    return hospitals
+
+
 @app.get("/hospitals/nearby")
 def get_nearby_hospitals(
     lat: float = Query(...),
@@ -906,6 +1303,16 @@ def get_nearby_hospitals(
     radius_km: float = Query(15.0),
 ):
     radius_m = int(radius_km * 1000)
+    print(f"[DEBUG] GOOGLE_MAPS_API_KEY set: {bool(GOOGLE_MAPS_API_KEY)}")
+
+    google_result = _get_hospitals_google(lat, lng, radius_m)
+    print(f"[DEBUG] google_result: {None if google_result is None else len(google_result)} hospitals")
+    if google_result is not None:
+        def _dist_google(h: dict) -> float:
+            return ((h["lat"] - lat) ** 2 + (h["lng"] - lng) ** 2) ** 0.5
+        google_result.sort(key=_dist_google)
+        return google_result[:15]
+
     # Broader tag coverage — OSM contributors in some regions tag hospitals
     # inconsistently (amenity=hospital, healthcare=hospital, or just
     # amenity=clinic for smaller facilities). Checking all three catches
@@ -922,20 +1329,44 @@ def get_nearby_hospitals(
     );
     out center tags;
     """
-    try:
-        resp = requests.post(
-            "https://overpass-api.de/api/interpreter",
-            data={"data": query},
-            timeout=12,
-        )
-        resp.raise_for_status()
-        elements = resp.json().get("elements", [])
-    except Exception as e:
-        # Overpass is a free, shared, occasionally slow/rate-limited public
-        # service — don't fail the whole page over it. Log and return an
-        # empty list so the map just shows no hospital pins instead of an
-        # error the user can't do anything about.
-        print(f"Hospital lookup failed (Overpass): {e}")
+    # Overpass has several independently-run public mirrors. overpass-api.de
+    # (the default/main one) frequently 504s under load since it's the most
+    # heavily used. Trying a short list of mirrors in order means one being
+    # slow/down doesn't take out hospital data entirely.
+    OVERPASS_MIRRORS = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.openstreetmap.ru/api/interpreter",
+    ]
+    headers = {
+        # Overpass's public instances return 406 Not Acceptable for requests
+        # carrying a generic/default User-Agent (e.g. plain
+        # "python-requests/x.y") — they expect a real, identifying client
+        # string. Also explicitly ask for JSON.
+        "User-Agent": "UrbanHeatIntelligencePlatform/1.0 (hackathon project)",
+        "Accept": "application/json",
+    }
+
+    elements = []
+    last_error = None
+    for mirror_url in OVERPASS_MIRRORS:
+        try:
+            resp = requests.post(mirror_url, data={"data": query}, timeout=12, headers=headers)
+            resp.raise_for_status()
+            elements = resp.json().get("elements", [])
+            last_error = None
+            break  # got a good response, stop trying further mirrors
+        except Exception as e:
+            last_error = e
+            print(f"Hospital lookup failed on {mirror_url}: {e}")
+            continue  # try the next mirror
+
+    if last_error is not None:
+        # All mirrors failed — Overpass is a free, shared, occasionally
+        # slow/rate-limited public service. Don't fail the whole page over
+        # it; log and return an empty list so the map just shows no
+        # hospital pins instead of an error the user can't do anything about.
+        print(f"Hospital lookup failed on all Overpass mirrors: {last_error}")
         return []
 
     hospitals = []
@@ -960,7 +1391,16 @@ def get_nearby_hospitals(
                 "source": "OpenStreetMap",
             }
         )
-    return hospitals
+    # Cap to the nearest 15, sorted by straight-line distance from the query
+    # point. Applied regardless of source: Google's maxResultCount already
+    # limits it to 20, but the Overpass fallback has no such cap and can
+    # return hundreds of clinics/hospitals within a 15km radius, which is
+    # both overkill for the map and slow to render.
+    def _dist(h: dict) -> float:
+        return ((h["lat"] - lat) ** 2 + (h["lng"] - lng) ** 2) ** 0.5
+
+    hospitals.sort(key=_dist)
+    return hospitals[:15]
 
 
 # ------------------------------------------------------------
@@ -1087,6 +1527,5 @@ def get_route_directions(req: RouteDirectionsRequest):
 # Health check
 # ------------------------------------------------------------
 @app.get("/health")
-
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
