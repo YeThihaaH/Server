@@ -5,3 +5,4 @@ supabase
 anthropic
 apscheduler
 pydantic
+requests
