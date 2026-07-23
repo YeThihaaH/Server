@@ -67,9 +67,16 @@ def _run_weather_refresh():
 
 @app.on_event("startup")
 def start_weather_scheduler():
-    scheduler.add_job(_run_weather_refresh, "interval", minutes=10, next_run_time=None)
+    # BUG FIX: next_run_time=None does NOT mean "use default scheduling" —
+    # in APScheduler it explicitly means "add this job PAUSED." The job was
+    # being registered with a 10-minute interval trigger but never actually
+    # firing on its own, since nothing ever resumed it. Passing
+    # datetime.now() instead makes it run immediately on startup (so data
+    # isn't stale for up to 10 minutes after every deploy/restart) and then
+    # every 10 minutes after that via the interval trigger.
+    scheduler.add_job(_run_weather_refresh, "interval", minutes=10, next_run_time=datetime.now())
     scheduler.start()
-    print("[scheduler] Live weather refresh scheduled every 10 minutes.")
+    print("[scheduler] Live weather refresh scheduled every 10 minutes, starting now.")
 
 
 @app.on_event("shutdown")
@@ -1555,6 +1562,52 @@ def get_route_directions(req: RouteDirectionsRequest):
         "note": "Free-flow ETA, no live traffic data — OSRM public demo server.",
         "provider": "osrm",
     }
+
+
+# ------------------------------------------------------------
+# Admin: externally-triggered weather refresh
+#
+# On Render's free tier, the process spins down after ~15 min of no
+# traffic and cold-starts on the next request. The in-process
+# BackgroundScheduler above only runs while the process is alive, so it
+# can't reliably deliver "every 10 minutes" on its own — it depends on
+# something else keeping the process awake or waking it back up.
+#
+# This endpoint lets an EXTERNAL scheduler (e.g. a free cron service like
+# cron-job.org, or Render's own separate Cron Job service type) trigger a
+# refresh by hitting this URL every 10 minutes. Every hit is itself
+# incoming traffic, which also resets Render's 15-minute idle timer — so
+# one external cron job does double duty: keeps the app awake AND
+# triggers the actual refresh, without depending on the in-process
+# scheduler at all. The in-process scheduler above is left in place as a
+# harmless belt-and-suspenders extra (it'll also fire while awake), but
+# this endpoint is the reliable mechanism on free tier.
+#
+# Protected by a shared secret so random internet traffic can't spam your
+# OpenWeatherMap free-tier quota. Set WEATHER_REFRESH_SECRET in your
+# Render environment variables to any random string, then configure your
+# external cron to call:
+#   POST https://your-app.onrender.com/admin/refresh-weather?secret=YOUR_SECRET
+# ------------------------------------------------------------
+WEATHER_REFRESH_SECRET = os.environ.get("WEATHER_REFRESH_SECRET")
+
+
+@app.post("/admin/refresh-weather")
+def admin_refresh_weather(secret: str = Query(...)):
+    if not WEATHER_REFRESH_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="WEATHER_REFRESH_SECRET is not set on the server — refusing to run an unprotected admin endpoint.",
+        )
+    if secret != WEATHER_REFRESH_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    try:
+        update_weather.main()
+        return {"status": "ok", "refreshed_at": datetime.utcnow().isoformat()}
+    except Exception as e:
+        print(f"[admin] Manual weather refresh failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Refresh failed: {e}")
 
 
 # ------------------------------------------------------------
